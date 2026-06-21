@@ -119,6 +119,8 @@ module.exports = class OnvifServer {
             );
         }
 
+        this.initAudio();
+
         this.onvif = {
             DeviceService: {
                 Device: {
@@ -334,6 +336,75 @@ module.exports = class OnvifServer {
             .replace(/'/g, '&apos;');
     }
 
+    initAudio() {
+        if (!this.config.audio)
+            return;
+
+        let audio = typeof this.config.audio === 'object' ? this.config.audio : {};
+        let sampleRate = audio.sampleRate || 8000;
+        if (sampleRate >= 1000)
+            sampleRate = Math.round(sampleRate / 1000);
+
+        this.audioEnabled = true;
+        this.audioConfig = {
+            encoding: audio.encoding || 'G711',
+            sampleRate: sampleRate,
+            bitrate: audio.bitrate || 64,
+            channels: audio.channels || 1
+        };
+
+        this.audioSource = {
+            attributes: { token: 'audio_src_token' },
+            Channels: this.audioConfig.channels
+        };
+
+        let audioSourceConfiguration = {
+            Name: 'AudioSource',
+            UseCount: this.profiles.length,
+            attributes: { token: 'audio_src_config_token' },
+            SourceToken: 'audio_src_token'
+        };
+
+        let audioEncoderConfiguration = {
+            attributes: { token: 'audio_enc_config_token' },
+            Name: 'AudioEncoder',
+            UseCount: this.profiles.length,
+            Encoding: this.audioConfig.encoding,
+            Bitrate: this.audioConfig.bitrate,
+            SampleRate: this.audioConfig.sampleRate,
+            SessionTimeout: 'PT1000S'
+        };
+
+        for (let profile of this.profiles) {
+            profile.AudioSourceConfiguration = audioSourceConfiguration;
+            profile.AudioEncoderConfiguration = audioEncoderConfiguration;
+        }
+
+        this.logger.info(`CONFIG: ${this.config.name} - ONVIF audio ${this.audioConfig.encoding}/${this.audioConfig.sampleRate}kHz`);
+    }
+
+    audioProfileXml(profile) {
+        if (!profile.AudioSourceConfiguration || !profile.AudioEncoderConfiguration)
+            return '';
+
+        let source = profile.AudioSourceConfiguration;
+        let encoder = profile.AudioEncoderConfiguration;
+        return `
+        <tt:AudioSourceConfiguration token="${this.xmlEscape(source.attributes.token)}">
+          <tt:Name>${this.xmlEscape(source.Name)}</tt:Name>
+          <tt:UseCount>${source.UseCount}</tt:UseCount>
+          <tt:SourceToken>${this.xmlEscape(source.SourceToken)}</tt:SourceToken>
+        </tt:AudioSourceConfiguration>
+        <tt:AudioEncoderConfiguration token="${this.xmlEscape(encoder.attributes.token)}">
+          <tt:Name>${this.xmlEscape(encoder.Name)}</tt:Name>
+          <tt:UseCount>${encoder.UseCount}</tt:UseCount>
+          <tt:Encoding>${this.xmlEscape(encoder.Encoding)}</tt:Encoding>
+          <tt:Bitrate>${encoder.Bitrate}</tt:Bitrate>
+          <tt:SampleRate>${encoder.SampleRate}</tt:SampleRate>
+          <tt:SessionTimeout>${encoder.SessionTimeout}</tt:SessionTimeout>
+        </tt:AudioEncoderConfiguration>`;
+    }
+
     getRequestAction(body) {
         let bodyMatch = body.match(/<(?:\w+:)?Body\b[^>]*>([\s\S]*?)<\/(?:\w+:)?Body>/);
         if (!bodyMatch)
@@ -481,7 +552,7 @@ ${content}
           <tt:RateControl><tt:FrameRateLimit>${encoder.RateControl.FrameRateLimit}</tt:FrameRateLimit><tt:EncodingInterval>${encoder.RateControl.EncodingInterval}</tt:EncodingInterval><tt:BitrateLimit>${encoder.RateControl.BitrateLimit}</tt:BitrateLimit></tt:RateControl>
           <tt:H264><tt:GovLength>${encoder.H264.GovLength}</tt:GovLength><tt:H264Profile>${encoder.H264.H264Profile}</tt:H264Profile></tt:H264>
           <tt:SessionTimeout>${encoder.SessionTimeout}</tt:SessionTimeout>
-        </tt:VideoEncoderConfiguration>
+        </tt:VideoEncoderConfiguration>${this.audioProfileXml(profile)}
       </trt:Profiles>`;
     }
 
@@ -498,6 +569,39 @@ ${this.profiles.map((profile) => this.profileXml(profile)).join('\n')}
         <tt:Resolution><tt:Width>${this.videoSource.Resolution.Width}</tt:Width><tt:Height>${this.videoSource.Resolution.Height}</tt:Height></tt:Resolution>
       </trt:VideoSources>
     </trt:GetVideoSourcesResponse>`;
+    }
+
+    getAudioSourcesResponse() {
+        return `    <trt:GetAudioSourcesResponse>
+      <trt:AudioSources token="${this.xmlEscape(this.audioSource.attributes.token)}">
+        <tt:Channels>${this.audioSource.Channels}</tt:Channels>
+      </trt:AudioSources>
+    </trt:GetAudioSourcesResponse>`;
+    }
+
+    getAudioEncoderConfigurationsResponse() {
+        let encoder = this.profiles[0].AudioEncoderConfiguration;
+        return `    <trt:GetAudioEncoderConfigurationsResponse>
+      <trt:Configurations token="${this.xmlEscape(encoder.attributes.token)}">
+        <tt:Name>${this.xmlEscape(encoder.Name)}</tt:Name>
+        <tt:UseCount>${encoder.UseCount}</tt:UseCount>
+        <tt:Encoding>${this.xmlEscape(encoder.Encoding)}</tt:Encoding>
+        <tt:Bitrate>${encoder.Bitrate}</tt:Bitrate>
+        <tt:SampleRate>${encoder.SampleRate}</tt:SampleRate>
+        <tt:SessionTimeout>${encoder.SessionTimeout}</tt:SessionTimeout>
+      </trt:Configurations>
+    </trt:GetAudioEncoderConfigurationsResponse>`;
+    }
+
+    getAudioSourceConfigurationsResponse() {
+        let source = this.profiles[0].AudioSourceConfiguration;
+        return `    <trt:GetAudioSourceConfigurationsResponse>
+      <trt:Configurations token="${this.xmlEscape(source.attributes.token)}">
+        <tt:Name>${this.xmlEscape(source.Name)}</tt:Name>
+        <tt:UseCount>${source.UseCount}</tt:UseCount>
+        <tt:SourceToken>${this.xmlEscape(source.SourceToken)}</tt:SourceToken>
+      </trt:Configurations>
+    </trt:GetAudioSourceConfigurationsResponse>`;
     }
 
     getSnapshotUri(profileToken) {
@@ -561,6 +665,18 @@ ${this.profiles.map((profile) => this.profileXml(profile)).join('\n')}
                     return this.sendSoapResponse(response, this.getProfilesResponse());
                 case 'GetVideoSources':
                     return this.sendSoapResponse(response, this.getVideoSourcesResponse());
+                case 'GetAudioSources':
+                    if (!this.audioEnabled)
+                        return this.sendSoapFault(response, 'Audio is not configured');
+                    return this.sendSoapResponse(response, this.getAudioSourcesResponse());
+                case 'GetAudioEncoderConfigurations':
+                    if (!this.audioEnabled)
+                        return this.sendSoapFault(response, 'Audio is not configured');
+                    return this.sendSoapResponse(response, this.getAudioEncoderConfigurationsResponse());
+                case 'GetAudioSourceConfigurations':
+                    if (!this.audioEnabled)
+                        return this.sendSoapFault(response, 'Audio is not configured');
+                    return this.sendSoapResponse(response, this.getAudioSourceConfigurationsResponse());
                 case 'GetSnapshotUri':
                     return this.sendSoapResponse(response, this.getSnapshotUriResponse(profileToken));
                 case 'GetStreamUri':
@@ -652,9 +768,9 @@ ${this.profiles.map((profile) => this.profileXml(profile)).join('\n')}
                                         <d:Types>dn:NetworkVideoTransmitter</d:Types>
                                         <d:Scopes>
                                             onvif://www.onvif.org/type/video_encoder
-                                            onvif://www.onvif.org/type/ptz
+                                            ${this.audioEnabled ? 'onvif://www.onvif.org/type/audio_encoder' : ''}
                                             onvif://www.onvif.org/hardware/onvif
-                                            onvif://www.onvif.org/name/${this.config.name}
+                                            onvif://www.onvif.org/name/${this.config.name.replace(/\s+/g, '_')}
                                             onvif://www.onvif.org/location/
                                         </d:Scopes>
                                         <d:XAddrs>http://${this.config.hostname}:${this.config.ports.server}/onvif/device_service</d:XAddrs>

@@ -1,7 +1,7 @@
 onvif:
   - name: DrivewayCars                              # A user define named that will show up in the consumer device. Use letters only, no spaces or special characters
     description: DrivewayCars                       # A user define model that will show up in Protect Use letters only, no spaces or special characters
-    dev: enp3s0                                     # Parent interface name only (e.g. iot), not iot@enp1s0f1
+    dev: enp3s0                                     # Network interface to add virtual IP's too. use ip addr to find your name
     target:
       hostname: 192.168.1.73                        # Your cameras IPv4 address
       ports:

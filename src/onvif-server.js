@@ -6,7 +6,7 @@ const url = require('url');
 const fs = require('fs');
 const logger = require('simple-node-logger');
 
-const { getIp4FromMac } = require('./net-tools')
+const { getIp4FromMac, getIp4ForInterface } = require('./net-tools')
 
 Date.prototype.stdTimezoneOffset = function () {
     let jan = new Date(this.getFullYear(), 0, 1);
@@ -461,6 +461,63 @@ ${content}
     </tds:GetDeviceInformationResponse>`;
     }
 
+    getNetworkInterfacesResponse() {
+        let mac = this.xmlEscape((this.config.mac || '').toLowerCase());
+        let prefixLength = this.config.prefixLength || 24;
+        return `    <tds:GetNetworkInterfacesResponse>
+      <tds:NetworkInterfaces token="network_interface_1">
+        <tt:Enabled>true</tt:Enabled>
+        <tt:Info>
+          <tt:Name>rtsp2onvif</tt:Name>
+          <tt:HwAddress>${mac}</tt:HwAddress>
+          <tt:MTU>1500</tt:MTU>
+        </tt:Info>
+        <tt:IPv4>
+          <tt:Enabled>true</tt:Enabled>
+          <tt:Config>
+            <tt:Manual>
+              <tt:Address>${this.config.hostname}</tt:Address>
+              <tt:PrefixLength>${prefixLength}</tt:PrefixLength>
+            </tt:Manual>
+            <tt:DHCP>true</tt:DHCP>
+          </tt:Config>
+        </tt:IPv4>
+      </tds:NetworkInterfaces>
+    </tds:GetNetworkInterfacesResponse>`;
+    }
+
+    getWsdl(service) {
+        let wsdlPath = service == 'media' ? './wsdl/media_service.wsdl' : './wsdl/device_service.wsdl';
+        let endpoint = service == 'media'
+            ? `http://${this.config.hostname}:${this.config.ports.server}/onvif/media_service`
+            : `http://${this.config.hostname}:${this.config.ports.server}/onvif/device_service`;
+        return fs.readFileSync(wsdlPath, 'utf8').replace(
+            /http:\/\/localhost:8000\/onvif\/(device|media)_service/g,
+            endpoint
+        );
+    }
+
+    getDiscoveryScopeName() {
+        return encodeURIComponent(this.config.name.replace(/\s+/g, '_'));
+    }
+
+    normalizeProfileToken(profileToken) {
+        if (!profileToken || profileToken == 'MainStream')
+            return 'main_stream';
+        if (profileToken == 'SubStream')
+            return 'sub_stream';
+        return profileToken;
+    }
+
+    probeMatchesDiscovery(probeType) {
+        if (!probeType)
+            return true;
+
+        let normalized = String(probeType).toLowerCase();
+        return normalized.indexOf('networkvideotransmitter') > -1
+            || normalized.indexOf('video_encoder') > -1;
+    }
+
     profileXml(profile) {
         let token = this.xmlEscape(profile.attributes.token);
         let encoder = profile.VideoEncoderConfiguration;
@@ -540,7 +597,7 @@ ${this.profiles.map((profile) => this.profileXml(profile)).join('\n')}
     handleOnvifRequest(request, response) {
         this.readRequestBody(request, (body) => {
             let action = this.getRequestAction(body);
-            let profileToken = this.getRequestValue(body, 'ProfileToken');
+            let profileToken = this.normalizeProfileToken(this.getRequestValue(body, 'ProfileToken'));
 
             if (process.env.DEBUG) {
                 console.debug(`SERVER: Handling POST on ${url.parse(request.url, true).pathname}`);
@@ -557,6 +614,8 @@ ${this.profiles.map((profile) => this.profileXml(profile)).join('\n')}
                     return this.sendSoapResponse(response, this.getCapabilitiesResponse());
                 case 'GetDeviceInformation':
                     return this.sendSoapResponse(response, this.getDeviceInformationResponse());
+                case 'GetNetworkInterfaces':
+                    return this.sendSoapResponse(response, this.getNetworkInterfacesResponse());
                 case 'GetProfiles':
                     return this.sendSoapResponse(response, this.getProfilesResponse());
                 case 'GetVideoSources':
@@ -576,11 +635,11 @@ ${this.profiles.map((profile) => this.profileXml(profile)).join('\n')}
         if ((action == '/onvif/device_service' || action == '/onvif/media_service') && request.method == 'POST') {
             this.handleOnvifRequest(request, response);
         } else if (action == '/onvif/device_service' && request.method == 'GET') {
-            let xml = fs.readFileSync('./wsdl/device_service.wsdl', 'utf8');
+            let xml = this.getWsdl('device');
             response.writeHead(200, { 'Content-Type': 'text/xml; charset=utf-8' });
             response.end(xml);
         } else if (action == '/onvif/media_service' && request.method == 'GET') {
-            let xml = fs.readFileSync('./wsdl/media_service.wsdl', 'utf8');
+            let xml = this.getWsdl('media');
             response.writeHead(200, { 'Content-Type': 'text/xml; charset=utf-8' });
             response.end(xml);
         } else if (action == '/snapshot.png') {
@@ -616,63 +675,99 @@ ${this.profiles.map((profile) => this.profileXml(profile)).join('\n')}
         this.discoveryMessageNo = 0;
         this.discoverySocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
-        this.discoverySocket.on('message', (message, remote) => {
+        let devIp = this.config.dev ? getIp4ForInterface(this.logger, this.config.dev) : null;
+        let bindAddress = devIp || '0.0.0.0';
 
-            this.logger.debug(`SERVER: ${this.config.name} - Discovery request from ${remote.address}:${remote.port}`);
+        this.discoverySocket.on('error', (err) => {
+            this.logger.error(`SERVER: ${this.config.name} - WS-Discovery error: ${err.message}`);
+        });
+
+        this.discoverySocket.on('message', (message, remote) => {
+            this.logger.info(`SERVER: ${this.config.name} - Discovery request from ${remote.address}:${remote.port}`);
 
             xml2js.parseString(message.toString(), { tagNameProcessors: [xml2js['processors'].stripPrefix] }, (err, result) => {
-                let probeUuid = result['Envelope']['Header'][0]['MessageID'][0];
+                if (err || !result || !result['Envelope']) {
+                    this.logger.debug(`SERVER: ${this.config.name} - Discovery parse error: ${err ? err.message : 'invalid message'}`);
+                    return;
+                }
+
+                let probeUuid;
+                try {
+                    probeUuid = result['Envelope']['Header'][0]['MessageID'][0];
+                } catch (parseErr) {
+                    this.logger.debug(`SERVER: ${this.config.name} - Discovery message missing MessageID`);
+                    return;
+                }
+
                 let probeType = '';
                 try {
                     probeType = result['Envelope']['Body'][0]['Probe'][0]['Types'][0];
-                } catch (err) {
+                } catch (parseErr) {
                     probeType = '';
                 }
 
                 if (typeof probeType === 'object')
                     probeType = probeType._;
 
-                if (probeType === '' || probeType.indexOf('NetworkVideoTransmitter') > -1) {
-                    let response =
-                        `<?xml version="1.0" encoding="UTF-8"?>
-                        <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
-                            <SOAP-ENV:Header>
-                                <wsa:MessageID>uuid:${uuid.v1()}</wsa:MessageID>
-                                <wsa:RelatesTo>${probeUuid}</wsa:RelatesTo>
-                                <wsa:To SOAP-ENV:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
-                                <wsa:Action SOAP-ENV:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</wsa:Action>
-                                <d:AppSequence SOAP-ENV:mustUnderstand="true" MessageNumber="${this.discoveryMessageNo}" InstanceId="1234567890"/>
-                            </SOAP-ENV:Header>
-                            <SOAP-ENV:Body>
-                                <d:ProbeMatches>
-                                    <d:ProbeMatch>
-                                        <wsa:EndpointReference>
-                                            <wsa:Address>urn:uuid:${this.config.uuid}</wsa:Address>
-                                        </wsa:EndpointReference>
-                                        <d:Types>dn:NetworkVideoTransmitter</d:Types>
-                                        <d:Scopes>
-                                            onvif://www.onvif.org/type/video_encoder
-                                            onvif://www.onvif.org/type/ptz
-                                            onvif://www.onvif.org/hardware/onvif
-                                            onvif://www.onvif.org/name/${this.config.name}
-                                            onvif://www.onvif.org/location/
-                                        </d:Scopes>
-                                        <d:XAddrs>http://${this.config.hostname}:${this.config.ports.server}/onvif/device_service</d:XAddrs>
-                                        <d:MetadataVersion>1</d:MetadataVersion>
-                                    </d:ProbeMatch>
-                                </d:ProbeMatches>
-                            </SOAP-ENV:Body>
-                        </SOAP-ENV:Envelope>`;
+                if (!this.probeMatchesDiscovery(probeType))
+                    return;
 
-                    this.discoveryMessageNo++;
-                    let responseBuffer = Buffer.from(response);
-                    return dgram.createSocket('udp4').send(responseBuffer, 0, responseBuffer.length, remote.port, remote.address);
-                }
+                let scopeName = this.getDiscoveryScopeName();
+                let response =
+                    `<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
+  <SOAP-ENV:Header>
+    <wsa:MessageID>uuid:${uuid.v1()}</wsa:MessageID>
+    <wsa:RelatesTo>${probeUuid}</wsa:RelatesTo>
+    <wsa:To SOAP-ENV:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
+    <wsa:Action SOAP-ENV:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</wsa:Action>
+    <d:AppSequence SOAP-ENV:mustUnderstand="true" MessageNumber="${this.discoveryMessageNo}" InstanceId="1234567890"/>
+  </SOAP-ENV:Header>
+  <SOAP-ENV:Body>
+    <d:ProbeMatches>
+      <d:ProbeMatch>
+        <wsa:EndpointReference>
+          <wsa:Address>urn:uuid:${this.config.uuid}</wsa:Address>
+        </wsa:EndpointReference>
+        <d:Types>dn:NetworkVideoTransmitter</d:Types>
+        <d:Scopes>
+          onvif://www.onvif.org/type/video_encoder
+          onvif://www.onvif.org/hardware/onvif
+          onvif://www.onvif.org/name/${scopeName}
+          onvif://www.onvif.org/location/
+        </d:Scopes>
+        <d:XAddrs>http://${this.config.hostname}:${this.config.ports.server}/onvif/device_service</d:XAddrs>
+        <d:MetadataVersion>1</d:MetadataVersion>
+      </d:ProbeMatch>
+    </d:ProbeMatches>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>`;
+
+                this.discoveryMessageNo++;
+                this.discoverySocket.send(response, remote.port, remote.address, (sendErr) => {
+                    if (sendErr)
+                        this.logger.error(`SERVER: ${this.config.name} - Discovery response failed: ${sendErr.message}`);
+                    else
+                        this.logger.debug(`SERVER: ${this.config.name} - Discovery response sent to ${remote.address}:${remote.port}`);
+                });
             });
         });
 
-        this.discoverySocket.bind(3702, () => {
-            return this.discoverySocket.addMembership('239.255.255.250', this.config.hostname);
+        this.discoverySocket.bind({ port: 3702, address: bindAddress, exclusive: false }, () => {
+            let membershipAddresses = [this.config.hostname];
+            if (devIp && membershipAddresses.indexOf(devIp) === -1)
+                membershipAddresses.push(devIp);
+
+            for (let membershipAddress of membershipAddresses) {
+                try {
+                    this.discoverySocket.addMembership('239.255.255.250', membershipAddress);
+                    this.logger.info(`SERVER: ${this.config.name} - WS-Discovery joined 239.255.255.250 on ${membershipAddress}`);
+                } catch (membershipErr) {
+                    this.logger.warn(`SERVER: ${this.config.name} - WS-Discovery join failed on ${membershipAddress}: ${membershipErr.message}`);
+                }
+            }
+
+            this.logger.info(`SERVER: ${this.config.name} - WS-Discovery listening on ${bindAddress}:3702 (device at ${this.config.hostname})`);
         });
     }
 

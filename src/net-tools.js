@@ -18,6 +18,29 @@ function getIp4FromMac(logger, macAddress) {
     return null;
 }
 
+function getIp4ForInterface(logger, interfaceName) {
+    if (!interfaceName)
+        return null;
+
+    let networkInterfaces = os.networkInterfaces();
+    let addresses = networkInterfaces[interfaceName];
+
+    if (!addresses) {
+        logger.debug(`NET_SCAN: No interface named ${interfaceName}`);
+        return null;
+    }
+
+    for (let network of addresses) {
+        if (network.family == 'IPv4' && !network.internal) {
+            logger.debug(`NET_SCAN: Interface ${interfaceName} has IPv4 ${network.address}`);
+            return network.address;
+        }
+    }
+
+    logger.debug(`NET_SCAN: No IPv4 on interface ${interfaceName}`);
+    return null;
+}
+
 // Generate a UUIDv4
 function generateUUIDv4() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
@@ -36,6 +59,7 @@ function generateNetworkMac() {
 
 module.exports = {
     getIp4FromMac,
+    getIp4ForInterface,
     generateUUIDv4,
     generateNetworkMac
 }
